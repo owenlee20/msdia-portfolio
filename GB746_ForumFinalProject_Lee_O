@@ -1,0 +1,444 @@
+-- gb746, final project, owen lee
+
+-- setting context: changing role to sysadmin.
+USE ROLE sysadmin;
+
+-- creating new database to store forum data.
+CREATE DATABASE IF NOT EXISTS forum;
+
+-- creating warehouses for loading and querying data, separately.
+CREATE OR REPLACE WAREHOUSE forum_loading_wh WITH
+    WAREHOUSE_SIZE='SMALL'
+    AUTO_RESUME = TRUE
+    AUTO_SUSPEND = 300; 
+
+CREATE OR REPLACE WAREHOUSE forum_query_wh WITH
+    WAREHOUSE_SIZE='SMALL'
+    AUTO_RESUME = TRUE 
+    AUTO_SUSPEND = 300;
+
+-- switching roles to accountadmin to implement monitoring.
+USE ROLE accountadmin;
+
+-- creating a resource monitor to monitor data usage.
+CREATE OR REPLACE RESOURCE MONITOR forum_rm
+    WITH credit_quota = 100
+         frequency = monthly
+         start_timestamp = immediately
+         triggers
+            ON 80 PERCENT DO NOTIFY
+            ON 95 PERCENT DO SUSPEND
+            ON 100 PERCENT DO SUSPEND_IMMEDIATE;
+
+-- applying the new resource monitor to the querying warehouse.
+ALTER WAREHOUSE forum_query_wh
+SET RESOURCE_MONITOR = forum_rm;
+
+-- setting query timeouts in forum_query_wh warehouse.
+ALTER WAREHOUSE forum_query_wh SET statement_timeout_in_seconds = 1200;
+ALTER WAREHOUSE forum_query_wh SET statement_queued_timeout_in_seconds = 600;
+
+-- listing all warehouses to inspect resource monitor field and view all warehouses.
+SHOW WAREHOUSES;
+
+-- switching role to sysadmin.
+USE ROLE sysadmin;
+
+-- using forum database (public schema) and loading warehouse.
+USE forum.public;
+USE WAREHOUSE forum_loading_wh;
+
+-- creating tables where data will be stored.
+CREATE OR REPLACE TABLE badges (
+    badge_id integer,
+    user_id integer,
+    name string,
+    date datetime,
+    class string
+);
+
+CREATE OR REPLACE TABLE post_history (
+    post_history_id integer,
+    post_history_type_id integer,
+    post_id integer,
+    creation_date datetime,
+    user_id integer,
+    text string,
+    comment string
+);
+
+CREATE OR REPLACE TABLE post_links (
+    post_link_id integer,
+    creation_date datetime,
+    post_id integer,
+    related_post_id integer,
+    link_type_id integer
+);
+
+CREATE OR REPLACE TABLE posts (
+    post_id integer,
+    post_type_id integer,
+    creation_date datetime,
+    score integer,
+    view_count integer,
+    title string,
+    body string,
+    owner_user_id integer,
+    last_editor_user_id integer,
+    last_edit_date datetime,
+    last_activity_date datetime,
+    tags string,
+    answer_count integer,
+    comment_count integer,
+    accepted_answer_id integer,
+    parent_id integer,
+    closed_date datetime
+);
+
+CREATE OR REPLACE TABLE tags (
+    tag_id integer,
+    tag_name string,
+    count integer,
+    excerpt_post_id integer,
+    wiki_post_id integer
+);
+
+CREATE OR REPLACE TABLE users (
+    user_id integer,
+    display_name string,
+    about_me string,
+    reputation integer,
+    creation_date datetime,
+    last_access_date datetime,
+    views integer,
+    up_votes integer,
+    down_votes integer,
+    account_id integer
+);
+
+CREATE OR REPLACE TABLE votes (
+    vote_id integer,
+    post_id integer,
+    vote_type_id integer,
+    creation_date date
+);
+
+CREATE OR REPLACE TABLE comments_json (v variant);
+
+-- creating a stage, which specifies location of the s3 bucket used.
+CREATE STAGE retrocomputing_forum
+    url = 's3://retrocomputing-forum/';
+
+-- listing the files in the stage.
+LIST @retrocomputing_forum;
+
+-- creating file formats that match the unique data structures.
+CREATE OR REPLACE FILE FORMAT forum_csv
+    type='csv'
+    field_delimiter = ','
+    skip_header = 1
+    trim_space = false 
+    null_if = ('') 
+    field_optionally_enclosed_by = '\042'
+    comment = 'file format for comma-delimited data'
+;
+    
+CREATE OR REPLACE FILE FORMAT forum_pipe
+    type='csv'
+    field_delimiter = '|'
+    skip_header = 1
+    trim_space = false 
+    null_if = ('') 
+    field_optionally_enclosed_by = '\042'
+    comment = 'file format for pipe-delimited data'
+;
+
+CREATE OR REPLACE FILE FORMAT forum_tab
+    type='csv'
+    field_delimiter = '\t'
+    skip_header = 1
+    trim_space = false 
+    null_if = ('') 
+    field_optionally_enclosed_by = '\042'
+    comment = 'file format for tab-delimited data'
+;
+
+-- copying data from staging into tables.
+COPY INTO posts
+    FROM @retrocomputing_forum/posts
+        file_format = forum_csv;
+
+COPY INTO post_history
+    FROM @retrocomputing_forum/post_history
+        file_format = forum_csv;
+
+COPY INTO post_links
+    FROM @retrocomputing_forum/post_links
+        file_format = forum_csv;
+
+COPY INTO tags
+    FROM @retrocomputing_forum/tags
+        file_format = forum_tab;
+
+COPY INTO users
+    FROM @retrocomputing_forum/users
+        file_format = forum_csv;
+
+COPY INTO votes
+    FROM @retrocomputing_forum/votes
+        file_format = forum_pipe;
+
+-- copying data into the badges table while performing a data transformation.
+COPY INTO badges (badge_id, user_id, name, date, class)
+    FROM (
+        SELECT 
+            $1,
+            $2,
+            $3,
+            $4,
+            CASE
+                WHEN $5 = 1 THEN 'Gold'
+                WHEN $5 = 2 THEN 'Silver'
+                WHEN $5 = 3 THEN 'Bronze'
+                ELSE 'Unknown'
+            END AS class
+  FROM @retrocomputing_forum/badges.csv
+)
+file_format = forum_csv;
+
+-- Querying the badges table, but filtering for only gold badges.
+SELECT 
+*
+FROM badges
+    WHERE class = 'Gold';
+
+-- loading json data into the 'comments_json' table.
+COPY INTO comments_json (v)
+    FROM @retrocomputing_forum/comments.json
+        file_format = (type = json
+                strip_outer_array = true);
+
+-- creating a view that structures the comments data so it may be queried.
+CREATE OR REPLACE VIEW structured_comments AS
+    SELECT
+        v:comment_id::integer AS comment_id,
+        v:creation_date::timestamp AS creation_date,
+        v:post_id::integer AS post_id,
+        v:score::integer AS score,
+        v:text::string AS text,
+        v:user_id::integer AS user_id
+    FROM comments_json;
+
+-- creating a dev table that will include a new field.
+CREATE TABLE users_dev CLONE users;
+
+-- new field added is called 'years_of_activity'.
+ALTER TABLE users_dev
+    ADD COLUMN years_of_activity integer;
+
+-- populating the new column (field) with a calculation.
+UPDATE users_dev
+    SET years_of_activity = TIMESTAMPDIFF(YEAR, creation_date, last_access_date);
+
+-- renaming tables: original users table becomes the backup and dev table becomes the new users table.
+ALTER TABLE users RENAME TO users_backup;
+ALTER TABLE users_dev RENAME TO users;
+
+-- removing the backup table as the new users table will be used.
+DROP TABLE users_backup;
+
+-- querying the new users table to determine which users have 7 or more years of activity.
+SELECT
+*
+FROM 
+    users
+WHERE years_of_activity >= 7;
+
+-- switching to useradmin role to create a new role titled 'forum_query_role'.
+USE ROLE useradmin;
+CREATE ROLE forum_query_role;
+
+-- adding this newly created role to my account.
+SET my_user = CURRENT_USER();
+GRANT ROLE forum_query_role TO USER identifier($my_user);
+
+-- switching to securityadmin role to grant privileges to the newly created role.
+USE ROLE securityadmin;
+
+-- granting warehouse privileges.
+GRANT OPERATE, USAGE ON WAREHOUSE forum_query_wh TO ROLE forum_query_role;
+
+-- granting database, schema, and table/view select privileges.
+GRANT USAGE ON DATABASE forum TO ROLE forum_query_role;
+GRANT USAGE ON ALL SCHEMAS IN DATABASE forum TO ROLE forum_query_role;
+GRANT SELECT ON ALL TABLES IN DATABASE forum TO ROLE forum_query_role;
+GRANT SELECT ON ALL VIEWS IN DATABASE forum TO ROLE forum_query_role;
+
+-- listing all roles.
+SHOW ROLES;
+
+-- switching to the newly created role and querying warehousee to begin performing queries.
+USE ROLE forum_query_role;
+USE WAREHOUSE forum_query_wh;
+
+-- determining the date range of forum posts: what is the date range of forum posts?
+    -- the date range is April 19, 2016 (2016/04/19) to December 2, 2023 (2023/12/02).
+SELECT
+    MIN(creation_date) AS first_post_date,
+    MAX(creation_date) AS recent_post_date
+FROM
+    posts;
+
+-- counting users: how many users do we have?
+    -- there are 22305 users.
+SELECT
+    COUNT(*) AS num_users
+FROM
+    users;
+
+-- finding the users based on reputation: who are the top 5 users in terms of reputation?
+    -- raffzahn, stephen kitt, brian h, rwallace, 'omar and lorraine' are the top 5 useers, from first to fifth.
+SELECT
+    display_name,
+    reputation
+FROM
+    users
+GROUP BY
+    display_name,
+    reputation
+ORDER BY
+    reputation DESC
+LIMIT 5;
+
+-- determining year-to-year growth: is there a growth in the number of users year-over-year?
+    -- overall yes, there is a growth in the number of users year-over-year although it has been on a decline             since 2021.
+SELECT
+    EXTRACT(YEAR FROM creation_date) AS year,
+    COUNT(user_id) AS user_count
+FROM 
+    users
+GROUP BY 
+    EXTRACT(YEAR FROM creation_date)
+ORDER BY 
+    year;
+
+
+-- determining site access: what percent of users accessed the site recently (on or after 1/1/2023)?
+    -- 35.32% of users accessed the site recently.
+SELECT
+    COUNT(CASE 
+            WHEN last_access_date >= '2023-01-01' THEN user_id END
+            ) * 100.0 / COUNT(user_id) AS recent_access_percentage
+FROM 
+    users;
+
+-- determining badge frequency: what gold badge was earned the most?
+    -- the 'Famous Question' gold badge was earned the most at 231 times.
+SELECT 
+    name AS badge_name,
+    COUNT(*) AS badge_count,
+FROM badges
+    WHERE class = 'Gold'
+GROUP BY
+    badge_name
+ORDER BY
+    badge_count DESC;
+
+-- finding top users: which 10 users earned the most badges?
+    -- top 10 users are (in order): 6659, 79, 4274, 4335, 576, 4147, 7208, 780, 15334, 10854.
+SELECT
+    user_id,
+    COUNT(*) AS badge_count
+FROM
+    badges
+GROUP BY
+    user_id
+ORDER BY
+    badge_count DESC
+LIMIT 10;
+
+-- posts by year: how many posts were created per year?
+    -- see query results for specific number of posts in a given year.
+SELECT
+    EXTRACT(YEAR FROM creation_date) AS year,
+    COUNT(post_id) AS post_count
+FROM
+    posts
+GROUP BY
+    EXTRACT(YEAR FROM creation_date)
+ORDER BY
+    year;
+
+-- finding posts with accepted answers: what percent of posts have an accepted answer?
+    -- 62.38% of posts have an accepted answer.
+SELECT
+    (COUNT(CASE 
+            WHEN accepted_answer_id IS NOT NULL THEN 1 END
+            ) * 100.0) / COUNT(CASE 
+                                WHEN post_type_id = 1 THEN 1 END
+                                ) AS accepted_answer_pct
+FROM
+    posts
+WHERE
+    post_type_id = 1;
+
+-- finding posts with no accepted answers: what percent of posts do not have an accepted answer?
+    -- 6.15% of posts do not have an accepted answer.
+SELECT
+    (COUNT(CASE 
+            WHEN answer_count = 0 THEN 1 END
+            ) * 100.0) / COUNT(CASE 
+                                WHEN post_type_id = 1 THEN 1 END
+                                ) AS no_answer_pct
+FROM
+    posts
+WHERE
+    post_type_id = 1;
+
+-- post updates: which posts received the most updates?
+    -- see query results for which post_id received the most updates.
+SELECT
+    p.post_id,
+    p.title,
+    COUNT(ph.post_history_id) AS update_count
+FROM
+    posts p
+JOIN
+    post_history ph
+    ON 
+    p.post_id = ph.post_id
+WHERE
+    p.title IS NOT NULL
+GROUP BY
+    p.post_id, p.title
+ORDER BY
+    update_count DESC
+LIMIT 50;
+
+-- counting comments by users: which users contributed the most comments?
+    -- see query results for which user ids contributed the most comments.
+SELECT
+    u.display_name,
+    COUNT(ph.post_history_id) AS comment_count
+FROM
+    post_history ph
+JOIN
+    users u ON ph.user_id = u.user_id
+WHERE
+    ph.comment IS NOT NULL
+GROUP BY
+    u.display_name
+ORDER BY
+    comment_count DESC
+LIMIT 10;
+
+-- distinct types of votes on posts: how many distinct posts received a vote of 'spam' or 'offensive'?
+    -- 144 distinct posts received votes with 'spam' or 'offensive' votes.
+SELECT
+    COUNT(DISTINCT post_id) AS distinct_posts
+FROM
+    votes
+WHERE
+    vote_type_id = 12
+    OR
+    vote_type_id = 4;
