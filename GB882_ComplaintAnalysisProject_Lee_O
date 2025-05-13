@@ -1,0 +1,125 @@
+/* GB882 - Final Project (Part 1) - Owen Lee */
+
+/* QUERY #1: Based on this complaint data, when was the first complaint received? 
+
+Refer to the "date_received" field rather than the "date_sent_to_company" field.
+
+Provide the date in the field below and use the following format: YYYY-MM-DD. As an example, 2012-05-02, if that was the correct answer. 
+
+The first complaint was received 2018-01-01 (January 1, 2018). */
+
+SELECT 
+    date_received
+FROM
+    complaint_details
+ORDER BY
+    date_received ASC /* Using ASC yields the first complaint received as opposed to the most recent */
+LIMIT 1; /* Limiting to 1 record enhances optimization */
+
+
+/* QUERY #2: What financial products did we receive the most complaints about? 
+
+When making this determination, use the "subproduct" instead of the "product" for more detail.
+
+Provide the name of the subproduct in the field below. 
+
+The subproduct that we received the most complaints about was 'Credit reporting'. */
+
+SELECT
+    COUNT(*) AS total_complaints, /* Counting all records as total_complaints */
+    subproduct,
+FROM
+    complaint_details
+WHERE
+    subproduct IS NOT NULL /* Ensuring no null values are returned in the output */
+GROUP BY
+    subproduct
+ORDER BY
+    total_complaints DESC;
+
+    
+/* QUERY #3: What company received the most complaints about cryptocurrencies (or, in other words, the
+"virtual currency" subproduct) in 2019? 
+
+When writing the statement, I recommend using the YEAR. function. Also, you will need to use the date that the complaint was actually sent to the company, NOT when it was received.
+
+Provide the company name in the field below. (Use the exact name of the company shown in the results.) 
+
+Paypal Holdings, Inc received the most complaints about cryptocurrencies in 2019. */
+
+SELECT
+    company_name,
+    COUNT(*) AS total_complaints
+FROM
+    complaint_details
+WHERE
+    subproduct = 'Virtual currency' /* Filtering only for subproduct titeld 'Virtual currency' (case-sensitive) */
+    AND
+    YEAR(date_sent_to_company) = 2019 /* YEAR function is used to get the year out of the date variable */
+GROUP BY
+    company_name
+ORDER BY
+    total_complaints DESC
+LIMIT 1; /* Limiting to 1 record enhances optimization */
+
+
+/* QUERY #4: Compare the number of complaints received each month with the number of complaints received
+in the previous month. (They should be side-by-side in the results.) 
+
+When performing this calculation, use "date_received" as the date.
+
+Based on the results, what was the numeric change in complaints between October 2018 and November
+2018? As an example, if there were 300 fewer complaints in November than in October, the answer would be
+-300. (Do NOT include commas in your answer.) 
+
+The numeric change in complaints between Oct 2018 and Nov 2018 was -2848. */
+
+SELECT 
+    YEAR(date_received) AS year,
+    MONTH(date_received) AS month,
+    COUNT(*) AS total_complaints,
+    SUM(COUNT(*)) OVER (
+        PARTITION BY YEAR(date_received) 
+            ORDER BY MONTH(date_received) 
+            ROWS UNBOUNDED PRECEDING 
+            ) AS cumulative_complaints, /* Sums complaints and adds the previous row to it while putting this value in the row cumulative_complaints) */
+    COUNT(*) - LAG(COUNT(*), 1, 0) OVER ( /* Offsetting by 1 and initializing at 0 to ensure no null values are present in the output */
+        PARTITION BY YEAR(date_received) 
+            ORDER BY MONTH(date_received) 
+            ) AS complaint_change
+FROM
+    complaint_details
+GROUP BY 
+    YEAR(date_received),
+    MONTH(date_received)
+ORDER BY 
+    YEAR(date_received), 
+    MONTH(date_received);
+
+
+/* QUERY #5: What companies are doing a poor job of responding to complaints in a timely manner? 
+
+To answer this question, prepare a query that counts the number of total complaints, the number of untimely responses, and the percentage of untimely responses by company. (For the last metric, take the untimely responses and divide by the total number of complaints.) 
+
+Also, in the results, only show companies that had at least 200 complaints in the dataset. HINT: To count the number of untimely responses, you can use the following in your SELECT statement: COUNT(CASE WHEN timely_response = 'FALSE' THEN 1 END) AS untimely_complaints
+
+What company had the highest percentage of untimely responses? (Use the exact name of the company
+shown in the results.) 
+
+Ameritech Financial had the highest percentage of untimely responses. */
+
+SELECT 
+    company_name,
+    COUNT(*) AS total_complaints,
+    COUNT(CASE 
+            WHEN timely_response = 'FALSE' THEN 1 END) AS untimely_complaints,
+    (COUNT(CASE 
+            WHEN timely_response = 'FALSE' THEN 1 END) * 100.0 / COUNT(*)) AS pct_untimely_responses
+FROM 
+    complaint_details
+GROUP BY 
+    company_name
+HAVING 
+    COUNT(*) >= 200 /* Must be greater than or equal to 200 as noted in the prompt */
+ORDER BY 
+    pct_untimely_responses DESC; /* Ordered DESC to get the highest percentage at the top of the output */
